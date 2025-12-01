@@ -231,6 +231,8 @@ class RFM(torch.nn.Module):
         self.class_converter = class_converter
         self.time_limit_s = time_limit_s
         self.solver = solver
+        self.reg = 1e-3  # Default regularization, can be overridden in fit()
+        self.label_centering = False  # EigenPro does not support label centering
 
         if categorical_info is not None and fast_categorical:
             self.set_categorical_indices(**categorical_info)
@@ -344,8 +346,15 @@ class RFM(torch.nn.Module):
             AGOP matrix of shape (n_features, n_features) or (n_features,) if diagonal
         """
         samples = samples.to(self.device)
-        self.centers = self.centers.to(self.device)
-        
+
+        # For Nyström, use full training data for AGOP (not just landmarks)
+        if hasattr(self, '_nystrom_full_centers') and self._nystrom_full_centers is not None:
+            agop_centers = self._nystrom_full_centers.to(self.device)
+            agop_weights = self._nystrom_full_weights.to(self.device)
+        else:
+            agop_centers = self.centers.to(self.device)
+            agop_weights = self.weights
+
         if self.M is None:
             if self.diag:
                 self.M = torch.ones(samples.shape[-1], device=samples.device, dtype=samples.dtype)
@@ -359,7 +368,7 @@ class RFM(torch.nn.Module):
                 self.sqrtM = torch.eye(samples.shape[-1], device=samples.device, dtype=samples.dtype)
 
         agop_func = self.kernel_obj.get_agop_diag if self.diag else self.kernel_obj.get_agop
-        agop = agop_func(x=self.centers, z=samples, coefs=self.weights.t(), mat=self.sqrtM if self.use_sqrtM else self.M, center_grads=self.center_grads)
+        agop = agop_func(x=agop_centers, z=samples, coefs=agop_weights.t(), mat=self.sqrtM if self.use_sqrtM else self.M, center_grads=self.center_grads)
         return agop
     
     def reset_adaptive_bandwidth(self):
@@ -488,8 +497,8 @@ class RFM(torch.nn.Module):
         
     def fit_predictor(self, centers, targets, bs=None, lr_scale=1, **kwargs):
         """
-        Fit the kernel regression predictor using either least squares or EigenPro.
-        
+        Fit the kernel regression predictor using the configured solver.
+
         Parameters
         ----------
         centers : torch.Tensor
@@ -502,15 +511,18 @@ class RFM(torch.nn.Module):
             Learning rate scale factor for EigenPro
         **kwargs : dict
             Additional arguments passed to the predictor fitting methods
-            
+
         Notes
         -----
-        - Method selection depends on self.fit_using_eigenpro (set during initialization)
-        - For EigenPro, can optionally prefit with a subset for initialization
-        - Adaptive bandwidth is reset if bandwidth_mode is 'adaptive'
-        - Results are stored in self.weights
+        Solver selection (via self.solver):
+        - 'lstsq', 'solve', 'cholesky', 'lu': Direct solve with full kernel matrix O(n²)
+        - 'nystrom': Nyström approximation, memory-efficient O(n×m) where m << n
+        - 'eigenpro': EigenPro iterative solver for very large datasets
+        - 'log_reg': Logistic regression via IRLS
+
+        Results are stored in self.weights
         """
-        
+
         if self.bandwidth_mode == 'adaptive':
             if isinstance(self.kernel_obj, SumPowerLaplaceKernel):
                 raise ValueError("Adaptive bandwidth is not yet supported for SumPowerLaplaceKernel.")
@@ -526,6 +538,15 @@ class RFM(torch.nn.Module):
             self.weights = self.fit_predictor_logistic(centers, targets, **kwargs)
             return
 
+        # Nyström approximation - memory efficient for large datasets
+        if self.solver == 'nystrom':
+            n_landmarks = kwargs.pop('n_landmarks', None)
+            landmark_ratio = kwargs.pop('landmark_ratio', 0.1)
+            self.weights = self.fit_predictor_nystrom(centers, targets,
+                                                       n_landmarks=n_landmarks,
+                                                       landmark_ratio=landmark_ratio)
+            return
+
         if self.fit_using_eigenpro:
             assert not self.label_centering, "EigenPro does not yet support label centering"
             if self.prefit_eigenpro:
@@ -538,7 +559,7 @@ class RFM(torch.nn.Module):
             else:
                 initial_weights = None
 
-            self.weights = self.fit_predictor_eigenpro(centers, targets, bs=bs, lr_scale=lr_scale, 
+            self.weights = self.fit_predictor_eigenpro(centers, targets, bs=bs, lr_scale=lr_scale,
                                                        initial_weights=initial_weights, **kwargs)
         else:
             self.weights = self.fit_predictor_lstsq(centers, targets)
@@ -690,6 +711,118 @@ class RFM(torch.nn.Module):
             out = torch.linalg.solve(kernel_matrix, targets)
         
         return out
+
+    def fit_predictor_nystrom(self, centers, targets, n_landmarks=None, landmark_ratio=0.1):
+        """
+        Fit kernel regression using Nyström approximation for memory efficiency.
+
+        Instead of computing the full n×n kernel matrix, uses m landmark points.
+        The model stores landmarks as centers and computes weights for them.
+
+        Memory complexity: O(n × m + m²) instead of O(n²)
+
+        Parameters
+        ----------
+        centers : torch.Tensor
+            Training centers of shape (n, d)
+        targets : torch.Tensor
+            Target values of shape (n, c)
+        n_landmarks : int, optional
+            Number of landmark points. If None, uses landmark_ratio * n.
+        landmark_ratio : float, default=0.1
+            Fraction of points to use as landmarks (if n_landmarks not specified).
+            Higher values = more accurate but more memory.
+
+        Returns
+        -------
+        torch.Tensor
+            Alpha coefficients of shape (m, c) for landmark points
+
+        Notes
+        -----
+        We solve the reduced problem on landmarks:
+            (K_mm + reg*I + (1/reg) * K_mn @ K_nm) @ beta = K_mn @ y / reg + y_m
+
+        Then prediction is: f(x) = K(x, landmarks) @ beta
+
+        This formulation:
+        1. Only stores m landmark points as centers
+        2. Only computes m×m and n×m kernel matrices
+        3. Produces weights compatible with standard predict()
+
+        """
+        n = centers.shape[0]
+
+        if n_landmarks is None:
+            n_landmarks = max(100, min(int(n * landmark_ratio), 5000))
+        n_landmarks = min(n_landmarks, n)
+
+        if self.verbose:
+            print(f"Nyström approximation: {n} points, {n_landmarks} landmarks")
+
+        if centers.device != self.device:
+            centers = centers.to(self.device)
+            targets = targets.to(self.device)
+
+        # Select landmark points (random subset)
+        # Use consistent landmarks across iterations for stable AGOP learning
+        if not hasattr(self, '_nystrom_landmark_indices') or self._nystrom_landmark_indices is None:
+            self._nystrom_landmark_indices = torch.randperm(n, device=self.device)[:n_landmarks]
+        landmark_indices = self._nystrom_landmark_indices
+
+        landmarks = centers[landmark_indices]
+
+        # Compute kernel matrices
+        # K_mm: landmarks × landmarks (small, m×m)
+        K_mm = self.kernel(landmarks, landmarks)
+
+        # K_nm: all points × landmarks (n×m, manageable)
+        K_nm = self.kernel(centers, landmarks)
+
+        # Solve the reduced system:
+        # We want to minimize ||K_nm @ beta - y||^2 + reg * beta^T @ K_mm @ beta
+        # Normal equations: (K_mn @ K_nm + reg * K_mm) @ beta = K_mn @ y
+
+        # Build the system matrix (m × m)
+        system_matrix = K_nm.T @ K_nm + self.reg * K_mm
+        system_matrix.diagonal().add_(self.reg)  # Additional regularization for stability
+
+        # Build the RHS (m × c)
+        rhs = K_nm.T @ targets
+
+        # Solve
+        try:
+            beta = torch.linalg.solve(system_matrix, rhs)
+        except Exception as e:
+            if self.verbose:
+                print(f"Nyström solve failed: {e}, adding regularization")
+            system_matrix.diagonal().add_(self.reg * 10)
+            beta = torch.linalg.solve(system_matrix, rhs)
+
+        # Store full training data for AGOP computation
+        # but use landmarks for prediction
+        self._nystrom_full_centers = centers
+        self._nystrom_full_weights = self._compute_full_weights_from_landmarks(
+            centers, targets, landmarks, beta, K_nm
+        )
+
+        # Update centers to landmarks for prediction
+        self.centers = landmarks
+
+        return beta
+
+    def _compute_full_weights_from_landmarks(self, centers, targets, landmarks, beta, K_nm):
+        """
+        Compute approximate weights for all training points from landmark weights.
+
+        For AGOP computation, we need weights for all n points, not just landmarks.
+        We approximate: alpha_i ≈ (y_i - K(x_i, landmarks) @ beta) / reg
+
+        This gives us weights that represent the residual not captured by landmarks.
+        """
+        residuals = targets - K_nm @ beta
+        # These are approximate dual weights for the full training set
+        return residuals / self.reg
 
     def fit_predictor_eigenpro(self, centers, targets, bs, lr_scale, initial_weights=None, **kwargs):
         """
